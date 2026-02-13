@@ -58,6 +58,8 @@ class RiphahChatbot:
         self.vectorstore = None
         self.retriever = None
         self.prompt = None
+        self.conversation_history = []  # Track conversation context
+        self.max_history = 5  # Keep last 5 exchanges
         self.riphah_urls = [
             "https://riphah.edu.pk/",
             "https://riphah.edu.pk/about/",
@@ -237,7 +239,9 @@ class RiphahChatbot:
         return True
 
     def _setup_retriever_and_prompt(self):
-        self.retriever = self.vectorstore.as_retriever(search_kwargs={"k": 4})
+        self.retriever = self.vectorstore.as_retriever(
+            search_kwargs={"k": 6, "fetch_k": 10}
+        )
         template = f"""{self.SYSTEM_PROMPT}
 
 Context: {{context}}
@@ -267,91 +271,318 @@ Answer:"""
         return self.process_documents(documents)
 
     def chat(self, question):
+        """Enhanced chat with strong logical reasoning and validation"""
         if self.retriever is None or self.prompt is None:
             return "Please initialize the chatbot first", []
         try:
-            # Get RAG response with university-specific data
-            docs = self.retriever.invoke(question)
-            context = "\n\n".join([doc.page_content for doc in docs])
+            # Step 1: Analyze question intent and extract key information
+            query_analysis = self._analyze_question(question)
             
-            rag_prompt = f"""{self.SYSTEM_PROMPT}
-
-UNIVERSITY DATABASE CONTEXT:
-{context}
-
-User Question: {question}
-
-Based ONLY on the university database above, provide a specific and accurate answer. Include faculty names, program details, and exact information from the database."""
+            # Step 2: Enhance query for better retrieval
+            enhanced_question = self._enhance_question_advanced(question, query_analysis)
             
-            rag_response = self.llm.invoke(rag_prompt)
+            # Step 3: Retrieve relevant documents with scoring
+            docs_with_scores = self.vectorstore.similarity_search_with_score(enhanced_question, k=6)
             
-            # Get enhanced real-time response
-            realtime_prompt = f"""You are Riphah International University's expert assistant. Your role is to provide COMPREHENSIVE, DETAILED, and ACCURATE information.
-
-Key responsibilities:
-1. Provide SPECIFIC names of faculty members when asked
-2. Give EXACT program details and requirements
-3. Include PRECISE fee structures and financial information
-4. Mention specific campus locations and facilities
-5. Provide detailed admission procedures and deadlines
-6. Discuss research opportunities and achievements
-7. Highlight student services and support systems
-8. Be specific about department functions and offerings
+            # Filter by relevance (FAISS L2 distance < 1.5 is good match)
+            relevant_docs = [doc for doc, score in docs_with_scores if score < 1.5]
+            
+            # If too few results, take top 4
+            if len(relevant_docs) < 2:
+                relevant_docs = [doc for doc, score in docs_with_scores[:4]]
+            
+            if not relevant_docs:
+                return self._generate_fallback_response(question), []
+            
+            # Step 4: Build structured context
+            context = self._build_enhanced_context(relevant_docs)
+            conversation_context = self._get_conversation_context()
+            
+            # Step 5: Generate RAG response with chain-of-thought reasoning
+            rag_response = self._generate_rag_response(
+                question, context, conversation_context, query_analysis
+            )
+            
+            # Step 6: Generate enhanced knowledge response
+            enhanced_response = self._generate_knowledge_enhanced_response(
+                question, rag_response, query_analysis
+            )
+            
+            # Step 7: Intelligent synthesis with validation
+            final_response = self._synthesize_responses(
+                question=question,
+                rag_response=rag_response,
+                enhanced_response=enhanced_response,
+                query_analysis=query_analysis,
+                context=context
+            )
+            
+            # Step 8: Update conversation history
+            self._update_conversation_history(question, final_response)
+            
+            # Extract sources
+            sources = list(set([
+                doc.metadata.get('source_file', doc.metadata.get('source', 'Database'))
+                for doc in relevant_docs
+            ]))
+            
+            return final_response, sources
+            
+        except Exception as e:
+            return f"Error processing your question: {str(e)[:100]}", []
+    
+    def _analyze_question(self, question):
+        """Analyze question to understand intent and requirements"""
+        analysis_prompt = f"""Analyze this question:
 
 Question: {question}
 
-Provide a DETAILED response with specific facts, names, numbers, and examples. Do NOT be vague. Include:
-- Exact names when discussing people
-- Specific amounts for fees/costs
-- Precise details about programs
-- Clear procedures and steps
-- Department and campus specifics"""
+Provide:
+1. Intent: What is the user trying to find out? (e.g., admission_process, fee_details, program_info)
+2. Key entities: Extract specific names, programs, campuses mentioned
+3. Question type: Is this asking for facts, comparison, procedure, or general info?
+4. Specificity: Does the user want specific details or general overview?
+
+Provide brief analysis in 3-4 lines."""
+        
+        try:
+            analysis = self.llm.invoke(analysis_prompt)
+            return analysis.content
+        except:
+            return "General information query about Riphah University"
+    
+    def _enhance_question_advanced(self, question, analysis):
+        """Advanced query enhancement with semantic expansion"""
+        keyword_mappings = {
+            "admission": ["admission", "enrollment", "application", "eligibility", "requirements"],
+            "mbbs": ["MBBS", "medicine", "medical", "doctor", "healthcare"],
+            "bds": ["BDS", "dental", "dentistry"],
+            "fee": ["fee", "tuition", "cost", "charges", "payment"],
+            "scholarship": ["scholarship", "financial aid", "merit", "grant"],
+            "campus": ["campus", "location", "facilities", "address"],
+            "program": ["program", "degree", "course", "curriculum"],
+            "faculty": ["faculty", "professor", "teacher", "staff"],
+        }
+        
+        terms = []
+        question_lower = question.lower()
+        
+        for key, synonyms in keyword_mappings.items():
+            if any(syn in question_lower for syn in synonyms):
+                terms.extend(synonyms[:3])
+        
+        if terms:
+            return f"{question} [Related: {' '.join(set(terms))}]"
+        return question
+    
+    def _build_enhanced_context(self, docs):
+        """Build well-structured context from documents"""
+        if not docs:
+            return "No relevant information available."
+        
+        context_parts = []
+        seen_hashes = set()
+        
+        for i, doc in enumerate(docs, 1):
+            content = doc.page_content.strip()
+            content_hash = hash(content[:150])
             
-            realtime_response = self.llm.invoke(realtime_prompt)
+            if content_hash not in seen_hashes:
+                context_parts.append(f"[Information Source {i}]\n{content}")
+                seen_hashes.add(content_hash)
+        
+        return "\n\n===SEPARATOR===\n\n".join(context_parts)
+    
+    def _get_conversation_context(self):
+        """Get conversation history for contextual understanding"""
+        if not self.conversation_history:
+            return "This is the first question in the conversation."
+        
+        recent = self.conversation_history[-self.max_history:]
+        history = "\n".join([
+            f"Q: {h['q'][:80]}... A: {h['a'][:80]}..."
+            for h in recent
+        ])
+        return f"Recent context:\n{history}"
+    
+    def _generate_rag_response(self, question, context, conversation_context, analysis):
+        """Generate response based on retrieved documents with reasoning"""
+        rag_prompt = f"""{self.SYSTEM_PROMPT}
+
+===QUERY ANALYSIS===
+{analysis}
+
+===OFFICIAL UNIVERSITY DATABASE===
+{context}
+
+===CONVERSATION CONTEXT===
+{conversation_context}
+
+===USER QUESTION===
+{question}
+
+===REASONING INSTRUCTIONS===
+Apply systematic reasoning:
+1. IDENTIFY: What specific information does the user need?
+2. LOCATE: Find exact details in the database (names, numbers, procedures)
+3. VERIFY: Ensure information is current and accurate
+4. ORGANIZE: Structure the response logically
+5. COMPLETE: Address all aspects of the question
+
+Provide a detailed, fact-based answer using ONLY the database information above.
+Include specific details, names, numbers, and procedures.
+If information is incomplete, state what's available and what's missing.
+
+Your Response:"""
+        
+        try:
+            response = self.llm.invoke(rag_prompt)
+            return response.content
+        except:
+            return "Unable to generate response from database."
+    
+    def _generate_knowledge_enhanced_response(self, question, rag_response, analysis):
+        """Generate enhanced response with contextual knowledge"""
+        enhancement_prompt = f"""You are an expert on Pakistani university systems and Riphah International University.
+
+===QUERY ANALYSIS===
+{analysis}
+
+===QUESTION===
+{question}
+
+===DATABASE RESPONSE===
+{rag_response}
+
+Your task: Enhance this response with:
+1. **Context and Background**: Why is this important? How does it fit in the Pakistani education system?
+2. **Practical Guidance**: What should students know or do next?
+3. **Comparative Insights**: How does this compare to similar universities (if relevant)?
+4. **Additional Considerations**: What else should students consider?
+
+Provide contextual enhancement that SUPPORTS (never contradicts) the database response.
+Be specific and practical. Focus on helping the student make informed decisions.
+
+Your Enhanced Response:"""
+        
+        try:
+            response = self.llm.invoke(enhancement_prompt)
+            return response.content
+        except:
+            return "Additional context unavailable."
+    
+    def _synthesize_responses(self, question, rag_response, enhanced_response, 
+                            query_analysis, context):
+        """Intelligently synthesize responses with validation"""
+        synthesis_prompt = f"""You are a master synthesizer creating the ULTIMATE response for Riphah University queries.
+
+===USER QUESTION===
+{question}
+
+===QUERY ANALYSIS===
+{query_analysis}
+
+===RESPONSE SOURCE 1: Official Database (HIGHEST PRIORITY)===
+{rag_response}
+
+===RESPONSE SOURCE 2: Enhanced Context (SUPPORTING)===
+{enhanced_response}
+
+===SYNTHESIS INSTRUCTIONS===
+Create the BEST possible response by:
+
+1. **Foundation**: Use SOURCE 1 facts as the core (names, numbers, procedures)
+2. **Enhancement**: Add relevant context from SOURCE 2 that helps understanding
+3. **Integration**: Seamlessly blend both sources into ONE coherent response
+4. **Prioritization**: Official data > General knowledge
+5. **Completeness**: Address ALL aspects of the question
+6. **Clarity**: Use clear structure - bullet points for lists, paragraphs for explanations
+7. **Actionability**: Include next steps or contact information
+
+===QUALITY CHECKLIST===
+✓ Answers the question directly and completely
+✓ Includes specific facts (names, numbers, dates)
+✓ Provides practical guidance
+✓ Well-structured and easy to read
+✓ No contradictions between sources
+✓ Cites official sources when important
+
+===FORMAT GUIDELINES===
+- Start with direct answer
+- Use **bold** for important terms
+- Use bullet points (•) for lists
+- Include relevant links if discussing programs/fees
+- End with actionable next steps
+
+Create the FINAL, COMPREHENSIVE response now:"""
+        
+        try:
+            final = self.llm.invoke(synthesis_prompt)
+            response = final.content
             
-            # INTELLIGENT HYBRID SYNTHESIS
-            hybrid_prompt = f"""You are an EXPERT information synthesizer for Riphah International University. Your task is to create the ULTIMATE BEST response by intelligently combining two sources of information.
+            # Validate the response
+            if self._validate_response(question, response, rag_response):
+                return response
+            else:
+                # Fallback to RAG response if synthesis fails validation
+                return rag_response
+        except:
+            return rag_response
+    
+    def _validate_response(self, question, response, rag_response):
+        """Validate that response is high quality and addresses question"""
+        # Basic quality checks
+        if len(response) < 30:
+            return False
+        
+        # Check for common failure patterns
+        failure_patterns = [
+            "I don't have",
+            "Unable to",
+            "Cannot provide"
+        ]
+        
+        if any(pattern in response for pattern in failure_patterns) and len(response) < 150:
+            return False
+        
+        # Response should not be dramatically shorter than RAG response
+        if len(response) < len(rag_response) * 0.5:
+            return False
+        
+        return True
+    
+    def _generate_fallback_response(self, question):
+        """Generate helpful response when information is not available"""
+        return f"""I apologize, but I don't have specific information about that in my current database.
 
-SOURCE 1 - OFFICIAL DATABASE (Most Important - University Official Records):
-{rag_response.content}
+**How to get accurate information:**
 
-SOURCE 2 - KNOWLEDGE ENHANCEMENT (Supporting Context):
-{realtime_response.content}
+• 🌐 **Official Website**: Visit [https://riphah.edu.pk/](https://riphah.edu.pk/)
+• 📞 **Contact Admissions**: Check [contact page](https://riphah.edu.pk/contact/)
+• 📧 **Email**: Reach out to the specific department
+• 📱 **Campus Specific**:
+  - Faisalabad: [https://riphahfsd.edu.pk/](https://riphahfsd.edu.pk/)
+  - Sahiwal: [https://riphahsahiwal.edu.pk/](https://riphahsahiwal.edu.pk/)
 
-USER QUESTION: {question}
+**I can help with:**
+- General program information
+- Admission requirements
+- Campus locations and facilities
+- Fee structures
+- Scholarship information
 
-YOUR TASK - CREATE THE BEST POSSIBLE RESPONSE:
-1. **PRIORITIZE Official Data**: Use facts from SOURCE 1 (database) as the foundation
-2. **ENHANCE with Knowledge**: Add supporting details from SOURCE 2 where they enhance clarity
-3. **INCLUDE SPECIFIC DETAILS**:
-   - Faculty names and titles (from database)
-   - Program codes and exact requirements
-   - Fee amounts and payment schedules
-   - Campus locations and facilities
-   - Department heads and contacts
-   - Exact procedures with step-by-step instructions
-4. **CROSS-REFERENCE**: If both sources mention something, use the specific version
-5. **STRUCTURE CLEARLY**: Use bullet points for lists, clear paragraphs for explanations
-6. **BE COMPREHENSIVE**: Cover all aspects of the question
-7. **CITE SOURCES**: Mention which information comes from official records
-
-GUIDELINES FOR RESPONSE:
-- If database has specific info, USE IT and don't paraphrase
-- Add context from general knowledge to explain "WHY"
-- Be specific about names, numbers, and procedures
-- Format nicely with headers and bullet points
-- Include relevant links or contact information if known
-- Never contradict official university data
-- If uncertain about something, say "Please verify with [department/office]"
-
-CREATE THE BEST, MOST HELPFUL RESPONSE NOW:"""
-            
-            final_response = self.llm.invoke(hybrid_prompt)
-            sources = list(set([doc.metadata.get('source_file', doc.metadata.get('source', 'Database')) for doc in docs]))
-            
-            return final_response.content, sources
-        except Exception as e:
-            return f"Error processing your question: {str(e)[:100]}", []
+What else would you like to know?"""
+    
+    def _update_conversation_history(self, question, answer):
+        """Track conversation for contextual responses"""
+        self.conversation_history.append({
+            "q": question,
+            "a": answer,
+            "time": datetime.now().isoformat()
+        })
+        
+        if len(self.conversation_history) > self.max_history:
+            self.conversation_history = self.conversation_history[-self.max_history:]
 
 # Initialize session state
 if "chatbot" not in st.session_state:
@@ -462,7 +693,9 @@ with st.sidebar:
     
     if st.button("Clear Chat History", use_container_width=True):
         st.session_state.messages = []
-        st.success("Chat history cleared!")
+        if st.session_state.chatbot:
+            st.session_state.chatbot.conversation_history = []
+        st.success("Chat history and conversation memory cleared!")
     
     st.markdown("---")
     st.markdown("### 📁 Setup Instructions")
